@@ -15,6 +15,7 @@ class TradingBotService:
         self.uoa_scanner_task: asyncio.Task | None = None
         self.continuous_monitor_task: asyncio.Task | None = None
         self.position_health_monitor_task: asyncio.Task | None = None  # 🔥 NEW: Position tick health monitor
+        self.daily_report_task: asyncio.Task | None = None  # 🕒 NEW: Daily summary report task
         self.bot_lock = asyncio.Lock()
         self.scan_lock = asyncio.Lock()  # Prevent overlapping scans
         self.is_running = False
@@ -115,6 +116,98 @@ class TradingBotService:
             except Exception as e:
                 print(f"❌ Critical error in monitor worker: {e}")
                 await asyncio.sleep(2)  # Wait on critical error
+    
+    async def daily_report_worker(self):
+        """
+        Independent background task to send daily trade summary at precisely 15:31 PM.
+        Runs as long as the backend server is up.
+        """
+        import pandas as pd
+        from datetime import datetime
+        from .database import today_engine, sql_text
+        from .email_notifier import EmailNotifier
+        import os
+        
+        # Helper to get info without cyclic imports if possible
+        def _get_info():
+            try:
+                with open("broker_config.json", "r") as f:
+                    import json
+                    cfg = json.load(f)
+                active_user_id = cfg.get("active_user", "user1")
+                if "users" in cfg:
+                    user_data = cfg["users"].get(active_user_id, {})
+                    return user_data.get("kotak_ucc", active_user_id), user_data.get("name", "User")
+                return cfg.get("kotak_ucc", "kotak"), cfg.get("kotak_user_name", "User")
+            except Exception:
+                return "Unknown", "User"
+
+        last_sent_date = ""
+        print("🕒 Daily report worker active - scheduled for 15:31 PM")
+        
+        while True:
+            try:
+                now = datetime.now()
+                current_time = now.strftime("%H:%M")
+                current_date = now.strftime("%Y-%m-%d")
+                
+                # Check if it's 3:31 PM (15:31) and we haven't sent a report today
+                if current_time == "15:31" and last_sent_date != current_date:
+                    print(f"⏰ Daily Scheduled Report - 15:31 reached. Generating report for {current_date}...")
+                    
+                    ucc, name = _get_info()
+                    
+                    trades_for_email = []
+                    try:
+                        with today_engine.connect() as conn:
+                            # Try to fetch all today's trades
+                            if ucc and ucc != "Unknown":
+                                query_sql = sql_text("SELECT * FROM trades WHERE (ucc = :ucc OR ucc IS NULL) ORDER BY timestamp ASC")
+                                trades_df = pd.read_sql_query(query_sql, conn, params={"ucc": ucc})
+                            else:
+                                trades_df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
+                            
+                            trades_for_email = trades_df.to_dict('records')
+                            for r in trades_for_email:
+                                for k, v in r.items():
+                                    if pd.isna(v) or v == float('inf') or v == float('-inf'):
+                                        r[k] = None
+                    except Exception as db_err:
+                        print(f"❌ Database error during scheduled report: {db_err}")
+                    
+                    # Basic summary calcs
+                    total_trades = len(trades_for_email)
+                    net_pnl = sum(t.get('net_pnl', 0) or 0 for t in trades_for_email)
+                    
+                    # Extract trading mode (LIVE/PAPER) if possible
+                    mode = "REPORT"
+                    if self.strategy_instance:
+                        trading_mode = self.strategy_instance.params.get('trading_mode', 'Paper Trading')
+                        mode = 'LIVE' if trading_mode == 'Live Trading' else 'PAPER'
+                    
+                    # Start time for session
+                    login_time = getattr(self, 'bot_start_time', now)
+
+                    # Send the email!
+                    if os.getenv('NOTIFICATION_EMAIL'):
+                        await asyncio.to_thread(
+                            EmailNotifier.send_logout_notification,
+                            ucc, name, ucc, mode, login_time, now, total_trades, net_pnl, trades_for_email
+                        )
+                        print(f"✅ Daily 15:31 summary email sent to {os.getenv('NOTIFICATION_EMAIL')}")
+                    else:
+                        print("⚠️ No NOTIFICATION_EMAIL found - skipping daily scheduled report.")
+                        
+                    last_sent_date = current_date
+                
+                # Sleep exactly 30 seconds
+                await asyncio.sleep(30)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"❌ Error in Daily Report Worker: {e}")
+                await asyncio.sleep(60)
     
     async def websocket_health_worker(self):
         """
@@ -223,10 +316,10 @@ class TradingBotService:
                 try:
                     self.strategy_instance.option_instruments = await asyncio.wait_for(
                         self.strategy_instance.load_instruments(),
-                        timeout=60.0  # 60s for Kotak CSV scripmaster download + parse
+                        timeout=150.0  # 150s: allows 2 download attempts (90s + 120s) + parse
                     )
                 except asyncio.TimeoutError:
-                    raise Exception(f"Instrument loading timed out after 60 seconds. Check {_BROKER_LABEL} API connection.")
+                    raise Exception(f"Instrument loading timed out after 150 seconds. Check {_BROKER_LABEL} API connection.")
                 
                 # CRITICAL FIX: Set expiry from date string (format: YYYY-MM-DD)
                 # Only accepts actual dates, not keywords like CURRENT_WEEK

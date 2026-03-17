@@ -27,6 +27,10 @@ Kotak Neo API Access (Consumer Key & Secret)
 
 Operating System: Windows, macOS, or Linux
 
+⚠️ **IMPORTANT**: Because this project contains sensitive trading credentials, several configuration files are hidden from GitHub using `.gitignore`. 
+
+👉 **[READ THIS FIRST: Local Setup & Sensitive Files Guide](./LOCAL_SETUP_GUIDE.md)** for instructions on how to create the missing files needed to run the bot.
+
 🚀 Quick Start
 1. Clone Repository
 Bash

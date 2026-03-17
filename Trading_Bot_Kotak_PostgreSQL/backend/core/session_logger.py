@@ -6,6 +6,21 @@ from core.sync_service import ClientBotSync
 
 class SessionLogger:
     @staticmethod
+    def _get_active_user_info():
+        """Return (signup_client_id, login_username) from users.json (single shared login account)."""
+        import json, os
+        try:
+            users_file = os.path.join(os.path.dirname(__file__), '..', '..', 'login', 'server', 'users.json')
+            with open(users_file, 'r') as f:
+                users = json.load(f)
+            if users:
+                u = users[0]
+                return u.get('client_id') or u.get('clientId'), u.get('username')
+        except Exception as e:
+            print(f"[SessionLogger] Error reading users.json: {e}")
+        return None, None
+
+    @staticmethod
     def create_table():
         """Create sessions table if not exists"""
         with today_engine.connect() as conn:
@@ -32,21 +47,7 @@ class SessionLogger:
     @staticmethod
     def log_login(client_id: str, name: str, mode: str):
         """Log bot start/login"""
-        import json
-        import os
-        
-        # Get signup client_id and username from users.json
-        signup_client_id = None
-        login_username = None
-        try:
-            users_file = os.path.join(os.path.dirname(__file__), '..', '..', 'login', 'server', 'users.json')
-            with open(users_file, 'r') as f:
-                users = json.load(f)
-                if users and len(users) > 0:
-                    signup_client_id = users[0].get('client_id') or users[0].get('clientId')
-                    login_username = users[0].get('username')
-        except Exception as e:
-            print(f"Error reading users.json: {e}")
+        signup_client_id, login_username = SessionLogger._get_active_user_info()
         
         login_time = datetime.now()
         date = login_time.date()
@@ -108,16 +109,7 @@ class SessionLogger:
         import json
         import os
         import pandas as pd
-        # Get login_username from users.json for payload
-        login_username = None
-        try:
-            users_file = os.path.join(os.path.dirname(__file__), '..', '..', 'login', 'server', 'users.json')
-            with open(users_file, 'r') as f:
-                users = json.load(f)
-                if users and len(users) > 0:
-                     login_username = users[0].get('username')
-        except Exception as e:
-            print(f"Error reading users.json in log_logout: {e}")
+        _, login_username = SessionLogger._get_active_user_info()
 
         with today_engine.connect() as conn:
             # Get session details (login_time is critical for session-scoped trade calculation)
@@ -146,11 +138,9 @@ class SessionLogger:
                         time_mask = (all_trades_df['timestamp'] >= login_dt) & \
                                     (all_trades_df['timestamp'] <= logout_time)
 
-                        # Filter by client ID
-                        if 'client_id' in all_trades_df.columns:
-                            client_mask = (all_trades_df['client_id'] == signup_id)
-                        else:
-                            client_mask = pd.Series([True] * len(all_trades_df))
+                        # Filter by client ID using ucc column
+                        ucc_col = 'ucc' if 'ucc' in all_trades_df.columns else 'client_id'
+                        client_mask = (all_trades_df[ucc_col] == client_id) | (all_trades_df[ucc_col].isnull())
 
                         # Filter by trading mode
                         target_mode = 'Live Trading' if session_mode == 'LIVE' else 'Paper Trading'
@@ -257,16 +247,7 @@ class SessionLogger:
         import json
         import pandas as pd
 
-        # Get login_username from users.json for payload
-        login_username = None
-        try:
-            users_file = os.path.join(os.path.dirname(__file__), '..', '..', 'login', 'server', 'users.json')
-            with open(users_file, 'r') as f:
-                users = json.load(f)
-                if users and len(users) > 0:
-                     login_username = users[0].get('username')
-        except Exception as e:
-            print(f"Error reading users.json in cleanup: {e}")
+        _, login_username = SessionLogger._get_active_user_info()
 
         with today_engine.connect() as conn:
             # 1. Find orphaned sessions

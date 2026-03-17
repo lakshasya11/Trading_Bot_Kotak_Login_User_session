@@ -368,7 +368,6 @@
             <div class="select-wrapper">
                 <div class="dropdown-label">Select Database:</div>
                 <select id="dbSelect">
-                    <option value="">Choose a database...</option>
                     <option value="signup">Signup Data</option>
                     <option value="session">User Session Data</option>
                 </select>
@@ -433,7 +432,7 @@
                 return;
             }
             let html = `<p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 15px;">🔄 Auto-updating... (Last checked: ${new Date().toLocaleTimeString()})</p>`;
-            html += '<table><thead><tr><th>ID</th><th>Kite ID</th><th>Name</th><th>Email</th><th>Phone</th><th>Aadhar</th><th>QR Key</th><th>Username</th><th>Created At</th></tr></thead><tbody>';
+            html += '<table><thead><tr><th>ID</th><th>Client ID</th><th>Name</th><th>Email</th><th>Phone</th><th>Aadhar</th><th>QR Key</th><th>Username</th><th>Created At</th></tr></thead><tbody>';
             data.forEach((user, index) => {
                 html += `<tr><td>${index + 1}</td><td>${user.clientId || user.client_id || '-'}</td><td>${user.firstName || ''} ${user.lastName || ''}</td><td>${user.email || '-'}</td><td>${user.mobile || '-'}</td><td>${user.aadhar || '-'}</td><td>${user.qr_key || '-'}</td><td>${user.username || '-'}</td><td>${user.created_at || '-'}</td></tr>`;
             });
@@ -465,21 +464,21 @@
             pnlDisplay.style.color = ''; // Remove inline style if present
 
             let html = `<p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 15px;">🔄 Auto-updating... (Last checked: ${new Date().toLocaleTimeString()})</p>`;
-            html += '<table><thead><tr><th>S.No</th><th>Kite ID</th><th>Client ID</th><th>Name</th><th>Date</th><th>Login</th><th>Logout</th><th>Mode</th><th>Trades</th><th>Net P&L</th></tr></thead><tbody>';
+            html += '<table><thead><tr><th>S.No</th><th>Kotak ID</th><th>Client ID</th><th>Name</th><th>Date</th><th>Login</th><th>Logout</th><th>Mode</th><th>Trades</th><th>Net P&L</th></tr></thead><tbody>';
 
             data.forEach((s, index) => {
                 const net_pnl = s.pnl || 0;
                 const trades = s.total_trades || 0;
-                const kiteId = s.client_id || '-';
+                const kotakUcc = s.client_id || '-';
+                const signupId = s.signup_client_id || '-';
                 const name = s.name || '-';
                 const date = s.date || new Date(s.login_time).toLocaleDateString() || '-';
                 const loginTime = s.login_time;
                 const logoutTime = s.logout_time;
-                const clientId = s.display_client_id || s.signup_client_id || '-';
                 const mode = s.mode || 'UNKNOWN';
 
                 html += '<tr>';
-                html += `<td>${index + 1}</td><td>${kiteId}</td><td>${clientId}</td><td>${name}</td><td>${date}</td>`;
+                html += `<td>${index + 1}</td><td>${kotakUcc}</td><td>${signupId}</td><td>${name}</td><td>${date}</td>`;
                 html += `<td>${loginTime ? new Date(loginTime).toLocaleTimeString() : '-'}</td>`;
                 const logoutDisplay = logoutTime ? new Date(logoutTime) : null;
                 const isValidLogout = logoutDisplay && !isNaN(logoutDisplay.getTime());
@@ -572,13 +571,17 @@
         // -------------------------------
 
         window.addEventListener('load', function () {
-            document.getElementById('dbSelect').addEventListener('change', function () {
+            const dbSelect = document.getElementById('dbSelect');
+            dbSelect.addEventListener('change', function () {
                 clearInterval(updateInterval);
                 loadData();
                 if (this.value !== "") {
                     updateInterval = setInterval(loadData, 3000);
                 }
             });
+            // Auto-trigger initial load
+            loadData();
+            updateInterval = setInterval(loadData, 3000);
         });
     </script>
 </body>

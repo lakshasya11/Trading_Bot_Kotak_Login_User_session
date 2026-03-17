@@ -133,7 +133,7 @@ export default function ParametersPanel({ isMock = false }) {
             try {
                 // Fetch in background - don't block user
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 60000);
+                const timeoutId = setTimeout(() => controller.abort(), 180000); // 3 minutes for slow scripmaster downloads
                 
                 const response = await fetch(`http://localhost:8000/api/expiries/${selectedIndex}`, {
                     signal: controller.signal

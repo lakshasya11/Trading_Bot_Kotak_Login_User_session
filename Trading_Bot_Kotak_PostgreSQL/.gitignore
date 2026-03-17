@@ -58,3 +58,11 @@ trading_log.txt
 # Temporary files
 *.tmp
 temp/
+pending_sync.json
+
+# User Credentials & Private Data
+/login/server/users.json
+/login/server/.env
+**/*.json.old
+**/*.json.bak
+**/users.json

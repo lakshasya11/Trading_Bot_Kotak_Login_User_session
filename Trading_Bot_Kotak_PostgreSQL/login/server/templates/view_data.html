@@ -68,7 +68,7 @@
                     {% if loop.index0 == row|length - 1 and 'view_button' in columns %}
                     <!-- Logic for view button if needed, but the cell content 'View' is handled in python -->
                     {% if cell == 'View' %}
-                    <a href="/session_details/{{ row[1] }}/{{ row[3].split(' ')[0] if row[3] else '' }}">View
+                    <a href="http://localhost:5001/session_details/{{ row[1] }}/{{ row[3].split(' ')[0] if row[3] else '' }}">View
                         Details</a>
                     {% else %}
                     {{ cell }}

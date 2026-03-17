@@ -133,63 +133,47 @@ class ConnectionManager:
             print(f"   Message type: {message.get('type', 'unknown')}")
             return
         
-        # 🚦 INTELLIGENT RATE LIMITING: Different strategies per message type
-        if not hasattr(self, '_pending_sends'):
-            self._pending_sends = 0
+        if not hasattr(self, '_last_overflow_warning'):
             self._last_overflow_warning = 0
-            self._debug_log_buffer = []
-            self._last_debug_flush = 0
-            self._debug_log_count = 0
         
         message_type = message.get('type', 'unknown')
         
-        # Increased threshold to 100 to accommodate high-frequency updates (reduced lag)
-        if self._pending_sends > 100:
-            # Critical messages that must always be sent
+        # 🚀 HIGH PERFORMANCE: Increased threshold to 150 to accommodate high-frequency 30 FPS updates
+        # This prevents dropped ticks while still protecting against slow connections
+        if self._pending_sends > 150:
             critical_types = ['status_update', 'trade_update', 'position_update', 'shutdown', 'time_sync', 
                             'daily_performance_update', 'trade_status_update', 'debug_log_batch', 'debug_log', 'play_sound',
-                            'new_trade_log', 'batch_frame_update']  # 🚀 CRITICAL: Never drop trade/price updates
+                            'new_trade_log', 'batch_frame_update']
             
             if message_type not in critical_types:
-                # Drop this message to prevent WebSocket timeout
                 current_time = time.time()
                 if current_time - self._last_overflow_warning > 5:
                     print(f"[WARN] WebSocket overflow prevention: Dropping {message_type} (pending: {self._pending_sends})")
                     self._last_overflow_warning = current_time
                 return
-        
-        disconnected = []
-        
-        disconnected = []
-        
-        # Create a copy of the list to iterate over, in case we need to modify it
-        for connection in self.active_connections[:]:
+
+        # 🎯 PARALLEL BROADCAST: Send to all clients simultaneously to prevent head-of-line blocking
+        # One slow client will no longer delay others.
+        async def send_to_one(connection):
             try:
                 self._pending_sends += 1
-                # Reduced timeout from 15s to 5s to detect issues faster
+                # 5s timeout is appropriate for 30 FPS updates
                 await asyncio.wait_for(connection.send_text(json_message), timeout=5.0)
+                return None
+            except (asyncio.TimeoutError, Exception) as e:
+                # Group all failures (timeout, disconnect, runtime error)
+                return connection
+            finally:
                 self._pending_sends = max(0, self._pending_sends - 1)
-            except asyncio.TimeoutError:
-                self._pending_sends = max(0, self._pending_sends - 1)
-                print(f"[WARN] WebSocket send timeout for client (>5s)")
-                disconnected.append(connection)
-            except RuntimeError as e:
-                self._pending_sends = max(0, self._pending_sends - 1)
-                # Handle "WebSocket is not connected" errors gracefully
-                if "not connected" in str(e).lower():
-                    disconnected.append(connection)
-                else:
-                    print(f"[WARN] WebSocket runtime error: {e}")
-                    disconnected.append(connection)
-            except Exception as e:
-                self._pending_sends = max(0, self._pending_sends - 1)
-                # If sending fails, the client has likely disconnected. Remove them.
-                logging.debug(f"Failed to send to client: {e}")
-                disconnected.append(connection)
-        
-        # Clean up disconnected clients
-        for conn in disconnected:
-            await self.disconnect(conn)
+
+        # Execute all sends in parallel
+        if self.active_connections:
+            failed_connections = await asyncio.gather(*(send_to_one(conn) for conn in self.active_connections[:]))
+            
+            # Clean up dropped clients
+            for conn in failed_connections:
+                if conn:
+                    await self.disconnect(conn)
     
     def update_ping_metadata(self, websocket: WebSocket):
         """Update ping metadata for a connection"""

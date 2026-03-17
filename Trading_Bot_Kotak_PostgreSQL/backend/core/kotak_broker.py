@@ -31,7 +31,10 @@ import urllib.request
 from datetime import datetime, date, timezone, timedelta
 from typing import Dict, List, Optional
 
+import logging
 _IST = timezone(timedelta(hours=5, minutes=30))
+
+logger = logging.getLogger(__name__)
 
 from .broker_interface import BrokerInterface
 from .rate_limiter import api_rate_limiter, order_rate_limiter
@@ -490,8 +493,8 @@ class KotakBroker(BrokerInterface):
         # 🔍 DEBUG: Log when option tokens first appear
         if not hasattr(self, '_quote_option_debug_logged') and len(instruments) > 1:
             self._quote_option_debug_logged = True
-            print(f"[KOTAK] Quote batch URL query: {query_str[:200]}...")
-            print(f"[KOTAK] Scrip mappings count: {len(self._symbol_to_scrip)}")
+            logger.debug(f"[KOTAK] Quote batch URL query: {query_str[:200]}...")
+            logger.debug(f"[KOTAK] Scrip mappings count: {len(self._symbol_to_scrip)}")
 
         try:
             raw = await self._async_quote_get(url)
@@ -509,15 +512,15 @@ class KotakBroker(BrokerInterface):
                 self._quote_debug_logged = True
                 if items:
                     sample = items[0] if items else {}
-                    print(f"[KOTAK] Quote API sample response keys: {list(sample.keys())}")
-                    print(f"[KOTAK] Quote API sample: token={sample.get('exchange_token', 'N/A')}, "
+                    logger.debug(f"[KOTAK] Quote API sample response keys: {list(sample.keys())}")
+                    logger.debug(f"[KOTAK] Quote API sample: token={sample.get('exchange_token', 'N/A')}, "
                           f"pSymbol={sample.get('pSymbol', 'N/A')}, "
                           f"exchange={sample.get('exchange', 'N/A')}, "
                           f"ltp={sample.get('ltp', 'N/A')}, "
                           f"trdSym={sample.get('trdSym', 'N/A')}")
-                    print(f"[KOTAK] Reverse map keys: {list(reverse_map.keys())}")
+                    logger.debug(f"[KOTAK] Reverse map keys: {list(reverse_map.keys())}")
                 else:
-                    print(f"[KOTAK] Quote API returned empty response. Raw: {str(raw)[:200]}")
+                    logger.debug(f"[KOTAK] Quote API returned empty response. Raw: {str(raw)[:200]}")
 
             # 🔍 DEBUG: Log batch response details when options are first included
             if not hasattr(self, '_quote_batch_debug_logged') and len(instruments) > 1:
@@ -528,13 +531,13 @@ class KotakBroker(BrokerInterface):
                 if isinstance(raw, list) and raw and isinstance(raw[0], dict):
                     fault = raw[0].get("fault")
                 
-                print(f"[KOTAK] Batch quote response: {len(items)} valid items from API, "
+                logger.debug(f"[KOTAK] Batch quote response: {len(items)} valid items from API, "
                       f"requested {len(instruments)} instruments")
                 if fault:
-                    print(f"[KOTAK] ⚠️ Batch fault detected: {str(fault)[:200]}")
+                    logger.warning(f"[KOTAK] ⚠️ Batch fault detected: {str(fault)[:200]}")
                 for item in items[:3]:
                     if isinstance(item, dict):
-                        print(f"[KOTAK] Item: token={item.get('exchange_token','?')}, "
+                        logger.debug(f"[KOTAK] Item: token={item.get('exchange_token','?')}, "
                               f"exchange={item.get('exchange','?')}, "
                               f"ltp={item.get('ltp','?')}")
 
@@ -601,10 +604,10 @@ class KotakBroker(BrokerInterface):
                 self._quote_nomatch_count = 0
             if matched_count == 0 and items and self._quote_nomatch_count < 5:
                 self._quote_nomatch_count += 1
-                print(f"[KOTAK] ⚠️ Quote: {len(items)} items returned but 0 matched! "
+                logger.warning(f"[KOTAK] ⚠️ Quote: {len(items)} items returned but 0 matched! "
                       f"Check token/segment mapping.")
         except Exception as e:
-            print(f"[KOTAK] Quote batch error: {e}")
+            logger.error(f"[KOTAK] Quote batch error: {e}")
 
         return result
 
@@ -617,7 +620,7 @@ class KotakBroker(BrokerInterface):
         if exchange and exchange in self._instrument_cache:
             return self._instrument_cache[exchange]
         if not self._base_url:
-            print("[KOTAK] instruments: Not logged in yet, returning empty.")
+            logger.info("[KOTAK] instruments: Not logged in yet, returning empty.")
             return []
 
         inst_list = await asyncio.to_thread(
@@ -648,7 +651,7 @@ class KotakBroker(BrokerInterface):
         if exchange and exchange in self._instrument_cache:
             return self._instrument_cache[exchange]
         if not self._base_url:
-            print("[KOTAK] instruments_sync: Not logged in yet, returning empty.")
+            logger.info("[KOTAK] instruments_sync: Not logged in yet, returning empty.")
             return []
 
         inst_list = self._fetch_and_parse_scripmaster(exchange)
@@ -670,7 +673,26 @@ class KotakBroker(BrokerInterface):
     }
 
     def _fetch_and_parse_scripmaster(self, exchange=None) -> List[Dict]:
-        """Download scripmaster CSV from Kotak and parse into Kite-format dicts."""
+        """Download scripmaster CSV from Kotak and parse into Kite-format dicts.
+        Uses disk cache (valid for the trading day) to avoid re-downloading."""
+        import os
+        import tempfile
+
+        target_seg = self._EXCHANGE_TO_CSV_SEGMENT.get(exchange, "nse_fo")
+        today_str = datetime.now().strftime("%Y%m%d")
+        cache_file = os.path.join(tempfile.gettempdir(), f"kotak_scrip_{target_seg}_{today_str}.csv")
+
+        # ── Use disk cache if available (same trading day) ──────────────
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8", errors="replace") as f:
+                    csv_text = f.read()
+                if csv_text.strip():
+                    print(f"[KOTAK] Using cached scripmaster for {exchange} ({cache_file})")
+                    return self._parse_scripmaster_csv(csv_text)
+            except Exception as e:
+                print(f"[KOTAK] Cache read failed, re-downloading: {e}")
+
         # Step 1: Get file paths
         url = f"{self._base_url}/script-details/1.0/masterscrip/file-paths"
         raw = self._http_request("GET", url, self._quote_headers())
@@ -688,7 +710,6 @@ class KotakBroker(BrokerInterface):
             return []
 
         # Step 2: Find the right CSV URL for the exchange
-        target_seg = self._EXCHANGE_TO_CSV_SEGMENT.get(exchange, "nse_fo")
         csv_url = None
         for fp in file_paths:
             if isinstance(fp, str) and target_seg in fp:
@@ -696,21 +717,38 @@ class KotakBroker(BrokerInterface):
                 break
 
         if not csv_url:
-            print(f"[KOTAK] No scripmaster CSV found for {exchange} "
-                  f"(segment {target_seg}).")
+            logger.warning(f"[KOTAK] No scripmaster CSV found for {exchange} (segment {target_seg}).")
             return []
 
-        # Step 3: Download CSV
-        print(f"[KOTAK] Downloading scripmaster: {csv_url}")
+        # Step 3: Download CSV with increased timeout
+        logger.info(f"[KOTAK] Downloading scripmaster for {exchange} from: {csv_url}")
         req = urllib.request.Request(csv_url)
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                csv_text = resp.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            print(f"[KOTAK] Failed to download scripmaster CSV: {e}")
+        csv_text = None
+        for attempt, timeout in enumerate([120, 180], start=1):
+            try:
+                start_time = time.time()
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    csv_text = resp.read().decode("utf-8", errors="replace")
+                duration = time.time() - start_time
+                logger.info(f"[KOTAK] Scripmaster download successful ({len(csv_text)} bytes, {duration:.1f}s)")
+                break
+            except Exception as e:
+                logger.error(f"[KOTAK] Scripmaster download attempt {attempt} failed (timeout={timeout}s): {e}")
+
+        if not csv_text:
+            logger.error("[KOTAK] All scripmaster download attempts failed.")
             return []
 
-        # Step 4: Parse CSV
+        # Step 4: Save to disk cache
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                f.write(csv_text)
+            logger.info(f"[KOTAK] Scripmaster cached to {cache_file}")
+        except Exception as e:
+            logger.warning(f"[KOTAK] Could not cache scripmaster: {e}")
+
+        # Step 5: Parse CSV
+        logger.info(f"[KOTAK] Parsing scripmaster CSV ({exchange})...")
         return self._parse_scripmaster_csv(csv_text)
 
     def _parse_scripmaster_csv(self, csv_text: str) -> List[Dict]:

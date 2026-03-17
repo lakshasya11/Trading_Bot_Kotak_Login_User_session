@@ -224,6 +224,9 @@ function App() {
             };
 
             const handleMessage = (event) => {
+                // ANY message from server resets the heartbeat timer
+                lastServerTimeReceivedRef.current = Date.now();
+                
                 try {
                     const data = JSON.parse(event.data);
 
@@ -809,8 +812,8 @@ function App() {
             if (lastServerTimeReceivedRef.current && socketStatus === 'CONNECTED') {
                 const timeSinceLastUpdate = Date.now() - lastServerTimeReceivedRef.current;
 
-                // If no updates for 5 seconds, connection is frozen - force reconnect
-                if (timeSinceLastUpdate > 5000) {
+                // If no updates for 10 seconds, connection is frozen - force reconnect
+                if (timeSinceLastUpdate > 10000) {
                     console.error(`🚨 HEARTBEAT FAILED: No updates for ${(timeSinceLastUpdate / 1000).toFixed(1)}s - forcing reconnect`);
 
                     // Mark as disconnected

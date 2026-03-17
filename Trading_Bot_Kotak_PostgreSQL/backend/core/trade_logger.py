@@ -158,7 +158,8 @@ class TradeLogger:
                     ('direction', 'TEXT'),  # CE or PE
                     # 🆕 Candle Data Tracking
                     ('candle_open_price', 'REAL'),  # Candle open price at entry
-                    ('candle_close_price', 'REAL')  # Candle close price at exit
+                    ('candle_close_price', 'REAL'),  # Candle close price at exit
+                    ('ucc', 'TEXT')  # User UCC for per-user data separation
                 ]
                 
                 for col_name, col_type in new_columns:

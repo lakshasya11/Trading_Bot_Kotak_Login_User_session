@@ -162,6 +162,7 @@ class Strategy:
         self._ui_straddle_dirty = False
         self._ui_trade_dirty = False
         self._ui_performance_dirty = False
+        self._ui_expiry_dirty = True  # 🛰️ NEW: Throttle expiry info (send once on startup/change)
         self._last_time_broadcast = 0  # Track last time-only broadcast
         
         # 🔥 BROADCAST FLUSH QUEUE: Ensure pending broadcasts are sent before shutdown
@@ -231,6 +232,20 @@ class Strategy:
         if flushed_count > 0:
             await self._log_debug("Broadcast Flush", f"✅ Flushed {flushed_count} pending broadcasts")
     
+    async def flush_pending_trades(self, timeout_seconds: float = 2.0):
+        """Wait for any in-flight log_trade_with_retry tasks to complete before shutdown."""
+        import time as _t
+        deadline = _t.time() + timeout_seconds
+        pending = [t for t in asyncio.all_tasks() if 'log_trade_with_retry' in t.get_name()]
+        if pending:
+            await self._log_debug("Trade Flush", f"⏳ Waiting for {len(pending)} pending trade log(s)...")
+            try:
+                remaining = max(0.1, deadline - _t.time())
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=remaining)
+                await self._log_debug("Trade Flush", "✅ All pending trades flushed to database.")
+            except asyncio.TimeoutError:
+                await self._log_debug("Trade Flush", "⚠️ Trade flush timed out — some trades may not be saved.")
+
     async def _calculate_trade_charges(self, tradingsymbol, exchange, entry_price, exit_price, quantity):
         BROKERAGE_PER_ORDER = 20.0; STT_RATE = 0.001; GST_RATE = 0.18; SEBI_RATE = 10 / 1_00_00_000; STAMP_DUTY_RATE = 0.00003
         if exchange == "NFO": EXCHANGE_TXN_CHARGE_RATE = 0.00053
@@ -829,21 +844,35 @@ class Strategy:
                 basket_price = 0.0
             return basket_total, float(basket_price), None
 
+    def _get_active_ucc(self):
+        """Get the active user's UCC for per-user data separation."""
+        try:
+            import json
+            with open("broker_config.json", "r") as f:
+                cfg = json.load(f)
+            if "users" in cfg:
+                active_user_id = cfg.get("active_user", "user1")
+                return cfg["users"].get(active_user_id, {}).get("kotak_ucc", active_user_id)
+            return cfg.get("kotak_ucc", "default")
+        except Exception:
+            return "default"
+
     async def _restore_daily_performance(self):
         # ... (This function is unchanged)
         await self._log_debug("Persistence", "Restoring daily performance from database...")
         def db_call():
             try:
                 with today_engine.connect() as conn:
-                    # CRITICAL FIX: Filter by trading_mode to separate Paper and Live trades
                     current_mode = self.params.get("trading_mode", "Paper Trading")
+                    active_ucc = self._get_active_ucc()
                     query = sql_text(
                         "SELECT SUM(pnl), SUM(charges), SUM(net_pnl), "
                         "SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, "
                         "SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses "
-                        "FROM trades WHERE trading_mode = :mode OR trading_mode IS NULL"
+                        "FROM trades WHERE (trading_mode = :mode OR trading_mode IS NULL) "
+                        "AND (ucc = :ucc OR ucc IS NULL)"
                     )
-                    return conn.execute(query, {"mode": current_mode}).fetchone()
+                    return conn.execute(query, {"mode": current_mode, "ucc": active_ucc}).fetchone()
             except Exception as e:
                 print(f"Error restoring performance: {e}"); return None
         data = await asyncio.to_thread(db_call)
@@ -4160,6 +4189,7 @@ class Strategy:
                         "exit_slippage": 0,
                         "latency_ms": p.get("latency_ms"),
                         "trading_mode": self.params.get("trading_mode", "Paper Trading"),
+                        "ucc": self._get_active_ucc(),
                         "momentum_price_rising": p.get("momentum_price_rising", 0),
                         "momentum_accelerating": p.get("momentum_accelerating", 0),
                         "momentum_index_sync": p.get("momentum_index_sync", 0),
@@ -4255,6 +4285,7 @@ class Strategy:
                                 "exit_slippage": 0,
                                 "latency_ms": p.get("latency_ms"),
                                 "trading_mode": self.params.get("trading_mode", "Paper Trading"),
+                                "ucc": self._get_active_ucc(),
                                 "momentum_price_rising": p.get("momentum_price_rising", 0),
                                 "momentum_accelerating": p.get("momentum_accelerating", 0),
                                 "momentum_index_sync": p.get("momentum_index_sync", 0),
@@ -4349,6 +4380,7 @@ class Strategy:
                             "exit_slippage": 0,
                             "latency_ms": p.get("latency_ms"),
                             "trading_mode": self.params.get("trading_mode", "Paper Trading"),
+                            "ucc": self._get_active_ucc(),
                             "momentum_price_rising": p.get("momentum_price_rising", 0),
                             "momentum_accelerating": p.get("momentum_accelerating", 0),
                             "momentum_index_sync": p.get("momentum_index_sync", 0),
@@ -4683,6 +4715,7 @@ class Strategy:
                             "exit_slippage": 0,
                             "latency_ms": p.get("latency_ms"),
                             "trading_mode": self.params.get("trading_mode", "Paper Trading"),
+                            "ucc": self._get_active_ucc(),
                             "momentum_price_rising": p.get("momentum_price_rising", 0),
                             "momentum_accelerating": p.get("momentum_accelerating", 0),
                             "momentum_index_sync": p.get("momentum_index_sync", 0),
@@ -4899,6 +4932,7 @@ class Strategy:
                 "exit_slippage": exit_slippage,  # 🆕 Exit slippage
                 "latency_ms": p.get("latency_ms"),  # 🆕 Signal to order latency
                 "trading_mode": self.params.get("trading_mode", "Paper Trading"),  # 🆕 Track mode
+                "ucc": self._get_active_ucc(),
                 # 🆕 Confirmatory momentum check data
                 "momentum_price_rising": p.get("momentum_price_rising", 0),
                 "momentum_accelerating": p.get("momentum_accelerating", 0),
@@ -4919,7 +4953,8 @@ class Strategy:
                 "exit_supertrend_reason": p.get("exit_supertrend_reason", "N/A"),
                 # 🆕 CANDLE DATA TRACKING (captured at ENTRY time)
                 "candle_open_price": p.get("candle_open_price"),  # Candle open price at entry
-                "candle_close_price": p.get("candle_close_price")  # Candle close/LTP at entry (NOT at exit!)
+                "candle_close_price": p.get("candle_close_price"),  # Candle close/LTP at entry (NOT at exit!)
+                "direction": p.get("direction")  # CE or PE
             }
             
             # ⚡ CRITICAL FIX: Ensure values are valid before final operations
@@ -5699,6 +5734,7 @@ class Strategy:
                 "exit_slippage": exit_slippage,
                 "latency_ms": p.get("latency_ms"),
                 "trading_mode": self.params.get("trading_mode", "Paper Trading"),  # 🆕 Track mode
+                "ucc": self._get_active_ucc(),
                 # 🆕 Confirmatory momentum check data
                 "momentum_price_rising": p.get("momentum_price_rising", 0),
                 "momentum_accelerating": p.get("momentum_accelerating", 0),
@@ -6958,7 +6994,7 @@ class Strategy:
             self._tick_conflation_buffer.clear()
         
         # Expiry information (which expiry is selected and being traded)
-        if self.last_used_expiry and self.option_instruments:
+        if self._ui_expiry_dirty and self.last_used_expiry and self.option_instruments:
             # Get all available expiries for display
             today = date.today()
             future_expiries = sorted(list(set([
@@ -6979,6 +7015,7 @@ class Strategy:
                 "current_expiry": self.last_used_expiry.strftime('%Y-%m-%d') if self.last_used_expiry else '',
                 "available_expiries": available_expiries_list
             }
+            self._ui_expiry_dirty = False
         
         # Status update (connection, mode, index price, trend)
         if self._ui_status_dirty:
@@ -7219,6 +7256,7 @@ class Strategy:
                     self.freeze_limit = 10000
 
                 self.option_instruments = instruments or []
+                self._ui_expiry_dirty = True
                 return self.option_instruments
 
             except Exception as e:

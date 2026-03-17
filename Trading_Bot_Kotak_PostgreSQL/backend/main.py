@@ -68,6 +68,7 @@ from core.trade_logger import TradeLogger
 from core.bot_service import TradingBotService, get_bot_service
 from core.database import today_engine, all_engine, sql_text
 from core.session_logger import SessionLogger
+from core.email_notifier import EmailNotifier
 from sqlalchemy import text
 
 # ===== COOLDOWN MECHANISM =====
@@ -171,6 +172,12 @@ async def lifespan(app: FastAPI):
     # Reset bot state on startup
     service = await get_bot_service()
     service.is_running = False
+    
+    # Start the daily scheduled report worker (15:31 PM)
+    if not service.daily_report_task:
+        service.daily_report_task = asyncio.create_task(service.daily_report_worker())
+        print("[OK] Daily report worker (15:31 PM) started")
+    
     print("[OK] Bot ready (is_running = False)")
 
     # --- ADDED: Open Position Reconciliation Logic ---
@@ -207,11 +214,16 @@ async def lifespan(app: FastAPI):
     yield
     print("Application shutdown...")
     
-    # Stop bot if running and log logout
+    # Stop bot if running and log logout + send email
     service = await get_bot_service()
     if service.strategy_instance or service.is_running:
         try:
             pnl = 0; total_trades = 0; wins = 0; losses = 0; gross_pnl = 0; charges = 0
+            client_id = getattr(service, 'current_client_id', None) or _get_active_ucc_from_config() or 'Unknown'
+            name = getattr(service, 'current_user_name', None) or _get_active_user_info().get('name', 'Unknown')
+            login_time = getattr(service, 'bot_start_time', datetime.now())
+            logout_time = datetime.now()
+            mode = 'UNKNOWN'
             if service.strategy_instance:
                 pnl = getattr(service.strategy_instance, 'daily_net_pnl', 0)
                 stats = getattr(service.strategy_instance, 'performance_stats', {"winning_trades": 0, "losing_trades": 0})
@@ -220,14 +232,11 @@ async def lifespan(app: FastAPI):
                 total_trades = wins + losses
                 gross_pnl = getattr(service.strategy_instance, 'daily_gross_pnl', 0)
                 charges = getattr(service.strategy_instance, 'total_charges', 0)
-            try:
-                profile = await kite.profile()
-                client_id = profile.get('user_id', 'Unknown')
-            except:
-                client_id = getattr(service, 'current_client_id', 'Unknown')
+                trading_mode = service.strategy_instance.params.get('trading_mode', 'Paper Trading')
+                mode = 'LIVE' if trading_mode == 'Live Trading' else 'PAPER'
             SessionLogger.log_logout(client_id, pnl, total_trades, wins, losses, gross_pnl, charges)
         except Exception as e:
-            print(f"Failed to log session end on shutdown: {e}")
+            print(f"Failed to log/notify session end on shutdown: {e}")
 
     if service.ticker_manager_instance:
         try:
@@ -298,19 +307,8 @@ async def get_status():
     
     # Kotak uses auto-login via TOTP — no request token flow needed
     if BROKER_NAME == "kotak":
-        try:
-            profile = await kite.profile()
-            return {"status": "authenticated", "user": profile.get('user_id', 'Kotak User')}
-        except Exception:
-            # Kotak not yet logged in — trigger auto-login
-            try:
-                from core.broker_factory import generate_session_and_set_token
-                success, data = generate_session_and_set_token()
-                if success:
-                    return {"status": "authenticated", "user": data.get('user_id', 'Kotak User')}
-            except Exception as e:
-                print(f"[status] Kotak auto-login failed: {e}")
-            return {"status": "authenticated", "user": "Kotak User"}
+        user_info = _get_active_user_info()
+        return {"status": "authenticated", "user": user_info.get('id', 'Kotak User')}
     
     # Kite/Zerodha: check token and verify via profile call
     if current_token:
@@ -382,32 +380,47 @@ async def authenticate(token_request: TokenRequest):
         return {"status": "success", "message": "Authentication successful.", "user": data.get('user_id')}
     raise HTTPException(status_code=400, detail=data)
 
+def _get_active_ucc_from_config():
+    """Get active user UCC from broker_config.json for API-level filtering."""
+    try:
+        with open("broker_config.json", "r") as f:
+            cfg = json.load(f)
+        if "users" in cfg:
+            active_user_id = cfg.get("active_user", "user1")
+            return cfg["users"].get(active_user_id, {}).get("kotak_ucc", active_user_id)
+        return cfg.get("kotak_ucc", None)
+    except Exception:
+        return None
+
 @app.get("/api/trade_history")
 async def get_trade_history():
-    """Get today's trades. If today_engine is empty, fetch from all_engine filtered by today's date."""
+    """Get today's trades filtered by active user UCC."""
     def db_call():
         try:
             from datetime import datetime
             today_date = datetime.now().strftime("%Y-%m-%d")
+            active_ucc = _get_active_ucc_from_config()
             
             with today_engine.connect() as conn:
-                logger.info(f"🔍 Fetching trade history from: {today_engine.url.database}")
-                df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
+                logger.info(f"🔍 Fetching trade history for UCC: {active_ucc}")
+                if active_ucc:
+                    query = sql_text("SELECT * FROM trades WHERE (ucc = :ucc OR ucc IS NULL) ORDER BY timestamp ASC")
+                    df = pd.read_sql_query(query, conn, params={"ucc": active_ucc})
+                else:
+                    df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
                 logger.info(f"✅ Found {len(df)} trades in today_engine.")
                 
-                # If today_engine is empty, try all_engine filtered by today's date
                 if len(df) == 0:
                     logger.info(f"📋 today_engine is empty, checking all_engine for today's trades ({today_date})...")
                     with all_engine.connect() as all_conn:
-                        query = sql_text("SELECT * FROM trades WHERE timestamp LIKE :ts ORDER BY timestamp ASC")
-                        df = pd.read_sql_query(
-                            query,
-                            all_conn,
-                            params={"ts": f"{today_date}%"}
-                        )
+                        if active_ucc:
+                            query = sql_text("SELECT * FROM trades WHERE timestamp LIKE :ts AND (ucc = :ucc OR ucc IS NULL) ORDER BY timestamp ASC")
+                            df = pd.read_sql_query(query, all_conn, params={"ts": f"{today_date}%", "ucc": active_ucc})
+                        else:
+                            query = sql_text("SELECT * FROM trades WHERE timestamp LIKE :ts ORDER BY timestamp ASC")
+                            df = pd.read_sql_query(query, all_conn, params={"ts": f"{today_date}%"})
                         logger.info(f"✅ Found {len(df)} trades in all_engine for today.")
                 
-                # Convert to dict first, then sanitize manually to avoid pandas weakref bugs
                 records = df.to_dict('records')
                 for r in records:
                     for k, v in r.items():
@@ -423,9 +436,13 @@ async def get_trade_history():
 async def get_all_trade_history():
     def db_call():
         try:
+            active_ucc = _get_active_ucc_from_config()
             with all_engine.connect() as conn:
-                df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
-                # Convert to dict first, then sanitize manually to avoid pandas weakref bugs
+                if active_ucc:
+                    query = sql_text("SELECT * FROM trades WHERE (ucc = :ucc OR ucc IS NULL) ORDER BY timestamp ASC")
+                    df = pd.read_sql_query(query, conn, params={"ucc": active_ucc})
+                else:
+                    df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
                 records = df.to_dict('records')
                 for r in records:
                     for k, v in r.items():
@@ -433,7 +450,6 @@ async def get_all_trade_history():
                             r[k] = None
                 return records
         except Exception as e:
-            # Return empty list instead of error if table doesn't exist or is empty
             print(f"⚠️ All-time trade history fetch: {e}")
             return []
     return await asyncio.to_thread(db_call)
@@ -526,16 +542,17 @@ async def start_bot(req: StartRequest, service: TradingBotService = Depends(get_
     
     if result.get("status") == "success" and service.strategy_instance:
         try:
-            profile = await kite.profile()
-            client_id = profile.get('user_id', 'Unknown')
-            name = profile.get('user_name', 'Unknown User')
+            user_info = _get_active_user_info()
+            client_id = user_info.get('id', 'Unknown')
+            name = user_info.get('name', 'Unknown User')
             service.current_client_id = client_id
             service.current_user_name = name
+            service.bot_start_time = datetime.now()
             trading_mode = req.params.get('trading_mode', 'Paper Trading')
             mode = 'LIVE' if trading_mode == 'Live Trading' else 'PAPER'
             SessionLogger.log_login(client_id, name, mode)
         except Exception as e:
-            print(f"Failed to log session start: {e}")
+            print(f"Failed to log/notify session start: {e}")
     
     return result
 
@@ -545,22 +562,22 @@ async def stop_bot(service: TradingBotService = Depends(get_bot_service), authen
     
     if service.strategy_instance:
         try:
-            client_id = getattr(service, 'current_client_id', None)
-            if not client_id:
-                try:
-                    profile = await kite.profile()
-                    client_id = profile.get('user_id', 'Unknown')
-                except:
-                    client_id = 'Unknown'
-            pnl = service.strategy_instance.daily_net_pnl
-            total_trades = service.strategy_instance.performance_stats["winning_trades"] + service.strategy_instance.performance_stats["losing_trades"]
-            wins = service.strategy_instance.performance_stats["winning_trades"]
-            losses = service.strategy_instance.performance_stats["losing_trades"]
-            gross_pnl = service.strategy_instance.daily_gross_pnl
-            charges = service.strategy_instance.total_charges
+            client_id = getattr(service, 'current_client_id', None) or _get_active_ucc_from_config() or 'Unknown'
+            name = getattr(service, 'current_user_name', None) or _get_active_user_info().get('name', 'Unknown')
+            kite_id = client_id
+            trading_mode = service.strategy_instance.params.get('trading_mode', 'Paper Trading')
+            mode = 'LIVE' if trading_mode == 'Live Trading' else 'PAPER'
+            login_time = getattr(service, 'bot_start_time', datetime.now())
+            logout_time = datetime.now()
+            pnl = getattr(service.strategy_instance, 'daily_net_pnl', 0)
+            wins = service.strategy_instance.performance_stats.get('winning_trades', 0)
+            losses = service.strategy_instance.performance_stats.get('losing_trades', 0)
+            total_trades = wins + losses
+            gross_pnl = getattr(service.strategy_instance, 'daily_gross_pnl', 0)
+            charges = getattr(service.strategy_instance, 'total_charges', 0)
             SessionLogger.log_logout(client_id, pnl, total_trades, wins, losses, gross_pnl, charges)
         except Exception as e:
-            print(f"Failed to log session end: {e}")
+            print(f"Failed to log/notify session end: {e}")
     
     return await service.stop_bot()
 
@@ -711,7 +728,7 @@ async def get_available_expiries(index_name: str, service: TradingBotService = D
             try:
                 instruments = await asyncio.wait_for(
                     kite.instruments(exchange),
-                    timeout=45.0  # Extended timeout for initial load
+                    timeout=150.0  # Extended timeout for initial load (Kotak scripmaster can be huge)
                 )
                 
                 # Filter for the selected index and get unique expiries
@@ -941,25 +958,14 @@ async def db_viewer_page():
 
 @app.get("/api/sessions")
 async def get_sessions_api(service: TradingBotService = Depends(get_bot_service)):
-    target_client_id = None
-    try:
-        users_file = os.path.join(os.path.dirname(__file__), '..', 'login', 'server', 'users.json')
-        if os.path.exists(users_file):
-            with open(users_file, "r") as f:
-                users = json.load(f)
-                if users and len(users) > 0:
-                    target_client_id = users[0].get('client_id') or users[0].get('clientId')
-    except Exception as e:
-        print(f"Error reading active user from login/server/users.json: {e}")
+    active_ucc = _get_active_ucc_from_config()
 
     def db_call():
         try:
             with today_engine.connect() as conn:
-                if target_client_id:
-                    query = text("SELECT * FROM bot_sessions WHERE signup_client_id = :target_id OR client_id = :target_id ORDER BY login_time DESC")
-                    df_sessions = pd.read_sql_query(query, conn, params={"target_id": target_client_id})
-                    if df_sessions.empty:
-                        df_sessions = pd.read_sql_query("SELECT * FROM bot_sessions ORDER BY login_time DESC", conn)
+                if active_ucc:
+                    query = text("SELECT * FROM bot_sessions WHERE client_id = :ucc ORDER BY login_time DESC")
+                    df_sessions = pd.read_sql_query(query, conn, params={"ucc": active_ucc})
                 else:
                     df_sessions = pd.read_sql_query("SELECT * FROM bot_sessions ORDER BY login_time DESC", conn)
 
@@ -995,7 +1001,6 @@ async def get_sessions_api(service: TradingBotService = Depends(get_bot_service)
 
     newer_session_start_time = None
     for session in sessions:
-        session['display_client_id'] = session.get('signup_client_id') or session.get('client_id') or '-'
         mode = session.get('mode')
         if not mode or mode in ['None', 'null', 'UNKNOWN']:
             session['mode'] = 'PAPER'
@@ -1019,13 +1024,11 @@ async def get_sessions_api(service: TradingBotService = Depends(get_bot_service)
                         else (all_trades_df['timestamp'] <= logout_dt)
                     )
                     s_id = session.get('client_id')
-                    signup_id = session.get('signup_client_id')
-                    if signup_id:
-                        client_mask = (all_trades_df['client_id'] == signup_id)
-                    elif s_id:
-                        client_mask = (all_trades_df['client_id'] == s_id)
+                    ucc_col = 'ucc' if 'ucc' in all_trades_df.columns else 'client_id'
+                    if s_id:
+                        client_mask = (all_trades_df[ucc_col] == s_id) | (all_trades_df[ucc_col].isnull())
                     else:
-                        client_mask = (all_trades_df['client_id'].isnull())
+                        client_mask = pd.Series([True] * len(all_trades_df), index=all_trades_df.index)
                     
                     if 'trading_mode' in all_trades_df.columns:
                         target_mode = 'Live Trading' if session.get('mode') == 'LIVE' else 'Paper Trading'
@@ -1112,23 +1115,21 @@ async def logout(service: TradingBotService = Depends(get_bot_service)):
                 
                 if service.strategy_instance:
                     try:
-                        client_id = getattr(service, 'current_client_id', None)
-                        if not client_id:
-                            try:
-                                profile = await kite.profile()
-                                client_id = profile.get('user_id', 'Unknown')
-                            except:
-                                client_id = 'Unknown'
+                        client_id = getattr(service, 'current_client_id', None) or _get_active_ucc_from_config() or 'Unknown'
+                        name = getattr(service, 'current_user_name', None) or _get_active_user_info().get('name', 'Unknown')
+                        trading_mode = service.strategy_instance.params.get('trading_mode', 'Paper Trading')
+                        mode = 'LIVE' if trading_mode == 'Live Trading' else 'PAPER'
+                        login_time = getattr(service, 'bot_start_time', datetime.now())
+                        logout_time = datetime.now()
                         pnl = service.strategy_instance.daily_net_pnl
-                        total_trades = service.strategy_instance.performance_stats.get("winning_trades", 0) + \
-                                       service.strategy_instance.performance_stats.get("losing_trades", 0)
                         wins = service.strategy_instance.performance_stats.get("winning_trades", 0)
                         losses = service.strategy_instance.performance_stats.get("losing_trades", 0)
+                        total_trades = wins + losses
                         gross_pnl = service.strategy_instance.daily_gross_pnl
                         charges = service.strategy_instance.total_charges
                         SessionLogger.log_logout(client_id, pnl, total_trades, wins, losses, gross_pnl, charges)
                     except Exception as e:
-                        print(f"Failed to log session end during logout: {e}")
+                        print(f"Failed to log/notify session end during logout: {e}")
 
                 await service._cleanup_bot_state()
                 service.is_running = False
