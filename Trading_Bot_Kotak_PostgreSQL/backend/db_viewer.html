@@ -447,46 +447,57 @@
                 return;
             }
 
-            let grandTotalTrades = 0;
-            let grandTotalPnl = 0;
+            // Fetch live performance for the active session, then render
+            fetch(`${window.location.origin}/api/performance?t=${new Date().getTime()}`)
+                .then(r => r.json())
+                .catch(() => ({ trades_today: 0, net_pnl: 0 }))
+                .then(perf => {
+                    let grandTotalTrades = 0;
+                    let grandTotalPnl = 0;
 
-            data.forEach(s => {
-                const trades = s.total_trades || 0;
-                const net_pnl = s.pnl || 0;
-                grandTotalTrades += parseInt(trades) || 0;
-                grandTotalPnl += parseFloat(net_pnl) || 0;
-            });
+                    data.forEach(s => {
+                        if (!s.logout_time) return; // skip active row — use live perf instead
+                        grandTotalTrades += parseInt(s.total_trades) || 0;
+                        grandTotalPnl += parseFloat(s.pnl) || 0;
+                    });
 
-            document.getElementById('totalTradesDisplay').innerText = grandTotalTrades;
-            const pnlDisplay = document.getElementById('totalPnlDisplay');
-            pnlDisplay.innerText = `₹${grandTotalPnl.toFixed(2)}`;
-            pnlDisplay.className = `stat-value ${grandTotalPnl >= 0 ? 'color-green' : 'color-red'}`;
-            pnlDisplay.style.color = ''; // Remove inline style if present
+                    // Add live stats from running bot
+                    grandTotalTrades += parseInt(perf.trades_today) || 0;
+                    grandTotalPnl += parseFloat(perf.net_pnl) || 0;
 
-            let html = `<p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 15px;">🔄 Auto-updating... (Last checked: ${new Date().toLocaleTimeString()})</p>`;
-            html += '<table><thead><tr><th>S.No</th><th>Kotak ID</th><th>Client ID</th><th>Name</th><th>Date</th><th>Login</th><th>Logout</th><th>Mode</th><th>Trades</th><th>Net P&L</th></tr></thead><tbody>';
+                    document.getElementById('totalTradesDisplay').innerText = grandTotalTrades;
+                    const pnlDisplay = document.getElementById('totalPnlDisplay');
+                    pnlDisplay.innerText = `₹${grandTotalPnl.toFixed(2)}`;
+                    pnlDisplay.className = `stat-value ${grandTotalPnl >= 0 ? 'color-green' : 'color-red'}`;
+                    pnlDisplay.style.color = '';
 
-            data.forEach((s, index) => {
-                const net_pnl = s.pnl || 0;
-                const trades = s.total_trades || 0;
-                const kotakUcc = s.client_id || '-';
-                const signupId = s.signup_client_id || '-';
-                const name = s.name || '-';
-                const date = s.date || new Date(s.login_time).toLocaleDateString() || '-';
-                const loginTime = s.login_time;
-                const logoutTime = s.logout_time;
-                const mode = s.mode || 'UNKNOWN';
+                    let html = `<p style="font-size: 12px; color: var(--text-secondary); margin-bottom: 15px;">🔄 Auto-updating... (Last checked: ${new Date().toLocaleTimeString()})</p>`;
+                    html += '<table><thead><tr><th>S.No</th><th>Kotak ID</th><th>Client ID</th><th>Name</th><th>Date</th><th>Login</th><th>Logout</th><th>Mode</th><th>Trades</th><th>Net P&L</th></tr></thead><tbody>';
 
-                html += '<tr>';
-                html += `<td>${index + 1}</td><td>${kotakUcc}</td><td>${signupId}</td><td>${name}</td><td>${date}</td>`;
-                html += `<td>${loginTime ? new Date(loginTime).toLocaleTimeString() : '-'}</td>`;
-                const logoutDisplay = logoutTime ? new Date(logoutTime) : null;
-                const isValidLogout = logoutDisplay && !isNaN(logoutDisplay.getTime());
-                html += `<td>${isValidLogout ? logoutDisplay.toLocaleTimeString() : '<span class="active-status">Active</span>'}</td>`;
-                html += `<td>${mode}</td><td>${trades}</td>`;
-                html += `<td class="${net_pnl >= 0 ? 'color-green' : 'color-red'}">₹${parseFloat(net_pnl).toFixed(2)}</td></tr>`;
-            });
-            container.innerHTML = html + '</tbody></table>';
+                    data.forEach((s, index) => {
+                        const isActive = !s.logout_time;
+                        // For active row, use live perf data instead of stale DB values
+                        const trades = isActive ? (parseInt(perf.trades_today) || 0) : (s.total_trades || 0);
+                        const net_pnl = isActive ? (parseFloat(perf.net_pnl) || 0) : (s.pnl || 0);
+                        const kotakUcc = s.client_id || '-';
+                        const signupId = s.signup_client_id || '-';
+                        const name = s.name || '-';
+                        const date = s.date || new Date(s.login_time).toLocaleDateString() || '-';
+                        const loginTime = s.login_time;
+                        const logoutTime = s.logout_time;
+                        const mode = s.mode || 'UNKNOWN';
+
+                        html += '<tr>';
+                        html += `<td>${index + 1}</td><td>${kotakUcc}</td><td>${signupId}</td><td>${name}</td><td>${date}</td>`;
+                        html += `<td>${loginTime ? new Date(loginTime).toLocaleTimeString() : '-'}</td>`;
+                        const logoutDisplay = logoutTime ? new Date(logoutTime) : null;
+                        const isValidLogout = logoutDisplay && !isNaN(logoutDisplay.getTime());
+                        html += `<td>${isValidLogout ? logoutDisplay.toLocaleTimeString() : '<span class="active-status">Active</span>'}</td>`;
+                        html += `<td>${mode}</td><td>${trades}</td>`;
+                        html += `<td class="${net_pnl >= 0 ? 'color-green' : 'color-red'}">₹${parseFloat(net_pnl).toFixed(2)}</td></tr>`;
+                    });
+                    container.innerHTML = html + '</tbody></table>';
+                });
         }
 
         // --- Galaxy Particle Animation ---

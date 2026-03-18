@@ -960,6 +960,10 @@ async def db_viewer_page():
 async def get_sessions_api(service: TradingBotService = Depends(get_bot_service)):
     active_ucc = _get_active_ucc_from_config()
 
+    # If bot is running, refresh the active session's live stats before returning
+    if service.is_running and active_ucc:
+        await asyncio.to_thread(SessionLogger.update_active_session, active_ucc)
+
     def db_call():
         try:
             with today_engine.connect() as conn:
@@ -982,78 +986,19 @@ async def get_sessions_api(service: TradingBotService = Depends(get_bot_service)
                             clean[k] = None
                     sessions_data.append(clean)
 
-                try:
-                    df_trades = pd.read_sql_query("SELECT * FROM trades", conn)
-                except Exception:
-                    df_trades = pd.DataFrame()
-                return sessions_data, df_trades
+                return sessions_data
         except Exception as e:
             print(f"Error fetching session/trade data: {e}")
-            return [], pd.DataFrame()
+            return []
 
-    sessions, all_trades_df = await asyncio.to_thread(db_call)
-    
-    if not all_trades_df.empty and 'timestamp' in all_trades_df.columns:
-        try:
-            all_trades_df['timestamp'] = pd.to_datetime(all_trades_df['timestamp'], format='mixed')
-        except Exception:
-            all_trades_df['timestamp'] = pd.to_datetime(all_trades_df['timestamp'], errors='coerce')
+    sessions = await asyncio.to_thread(db_call)
 
-    newer_session_start_time = None
     for session in sessions:
         mode = session.get('mode')
         if not mode or mode in ['None', 'null', 'UNKNOWN']:
             session['mode'] = 'PAPER'
         else:
             session['mode'] = mode
-            
-        try:
-            login_str = session.get('login_time')
-            if login_str:
-                login_dt = pd.to_datetime(login_str)
-                logout_str = session.get('logout_time')
-                logout_dt = newer_session_start_time if newer_session_start_time else (
-                    pd.to_datetime(logout_str) if logout_str else datetime.now()
-                )
-                if logout_dt < login_dt:
-                    logout_dt = datetime.now()
-
-                if not all_trades_df.empty:
-                    mask = (all_trades_df['timestamp'] >= login_dt) & (
-                        (all_trades_df['timestamp'] < logout_dt) if newer_session_start_time
-                        else (all_trades_df['timestamp'] <= logout_dt)
-                    )
-                    s_id = session.get('client_id')
-                    ucc_col = 'ucc' if 'ucc' in all_trades_df.columns else 'client_id'
-                    if s_id:
-                        client_mask = (all_trades_df[ucc_col] == s_id) | (all_trades_df[ucc_col].isnull())
-                    else:
-                        client_mask = pd.Series([True] * len(all_trades_df), index=all_trades_df.index)
-                    
-                    if 'trading_mode' in all_trades_df.columns:
-                        target_mode = 'Live Trading' if session.get('mode') == 'LIVE' else 'Paper Trading'
-                        mode_mask = (all_trades_df['trading_mode'] == target_mode) | \
-                                    (all_trades_df['trading_mode'].isnull()) if target_mode == 'Paper Trading' \
-                                    else (all_trades_df['trading_mode'] == target_mode)
-                        session_window_trades = all_trades_df[mask & mode_mask & client_mask]
-                    else:
-                        session_window_trades = all_trades_df[mask & client_mask]
-                    
-                    real_trade_count = len(session_window_trades)
-                    real_net_pnl = session_window_trades['net_pnl'].sum() if 'net_pnl' in session_window_trades.columns \
-                                   else session_window_trades['pnl'].sum() if 'pnl' in session_window_trades.columns else 0.0
-                    real_gross_pnl = session_window_trades['pnl'].sum() if 'pnl' in session_window_trades.columns else 0.0
-                    real_charges = session_window_trades['charges'].sum() if 'charges' in session_window_trades.columns \
-                                   else real_gross_pnl - real_net_pnl
-                    
-                    session['total_trades'] = int(real_trade_count)
-                    session['pnl'] = float(real_net_pnl)
-                    session['gross_pnl'] = float(real_gross_pnl)
-                    session['charges'] = float(real_charges)
-                
-                newer_session_start_time = login_dt
-        except Exception as e:
-            print(f"Error calculating stats for session {session.get('id')}: {e}")
 
     return sessions
 

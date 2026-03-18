@@ -236,6 +236,58 @@ class SessionLogger:
                 sync_manager.sync_session_to_central(session_payload)
 
     @staticmethod
+    def update_active_session(client_id: str):
+        """Recalculate and update trades/pnl for the currently active (running) session."""
+        import pandas as pd
+        try:
+            with today_engine.connect() as conn:
+                session_result = conn.execute(text("""
+                    SELECT id, login_time, mode FROM bot_sessions
+                    WHERE client_id = :client_id AND logout_time IS NULL
+                    ORDER BY login_time DESC LIMIT 1
+                """), {"client_id": client_id})
+                session = session_result.fetchone()
+                if not session:
+                    return
+
+                login_dt = session.login_time
+                session_mode = session.mode
+                now = datetime.now()
+
+                all_trades_df = pd.read_sql_query("SELECT * FROM trades", conn)
+                total_trades = 0; gross_pnl = 0.0; pnl = 0.0; charges = 0.0; wins = 0; losses = 0
+
+                if not all_trades_df.empty and 'timestamp' in all_trades_df.columns:
+                    all_trades_df['timestamp'] = pd.to_datetime(all_trades_df['timestamp'], errors='coerce')
+                    time_mask = (all_trades_df['timestamp'] >= login_dt) & (all_trades_df['timestamp'] <= now)
+                    ucc_col = 'ucc' if 'ucc' in all_trades_df.columns else 'client_id'
+                    client_mask = (all_trades_df[ucc_col] == client_id) | (all_trades_df[ucc_col].isnull())
+                    target_mode = 'Live Trading' if session_mode == 'LIVE' else 'Paper Trading'
+                    if 'trading_mode' in all_trades_df.columns:
+                        mode_mask = (all_trades_df['trading_mode'] == target_mode) | \
+                                    (all_trades_df['trading_mode'].isnull() if target_mode == 'Paper Trading' else pd.Series([False]*len(all_trades_df)))
+                    else:
+                        mode_mask = pd.Series([True] * len(all_trades_df), index=all_trades_df.index)
+
+                    session_trades = all_trades_df[time_mask & client_mask & mode_mask]
+                    total_trades = len(session_trades)
+                    if total_trades > 0:
+                        gross_pnl = float(session_trades['pnl'].sum()) if 'pnl' in session_trades.columns else 0.0
+                        pnl = float(session_trades['net_pnl'].sum()) if 'net_pnl' in session_trades.columns else gross_pnl
+                        charges = float(session_trades['charges'].sum()) if 'charges' in session_trades.columns else (gross_pnl - pnl)
+                        check_col = 'net_pnl' if 'net_pnl' in session_trades.columns else 'pnl'
+                        wins = int(len(session_trades[session_trades[check_col] > 0]))
+                        losses = int(len(session_trades[session_trades[check_col] <= 0]))
+
+                conn.execute(text("""
+                    UPDATE bot_sessions SET total_trades=:t, pnl=:p, gross_pnl=:g, charges=:c, wins=:w, losses=:l
+                    WHERE id=:id
+                """), {"t": total_trades, "p": pnl, "g": gross_pnl, "c": charges, "w": wins, "l": losses, "id": session.id})
+                conn.commit()
+        except Exception as e:
+            print(f"[SessionLogger] update_active_session error: {e}")
+
+    @staticmethod
     def cleanup_orphaned_sessions():
         """
         Cleanup any sessions that were left open (logout_time is NULL) 
