@@ -374,6 +374,10 @@
             </div>
             <div id="sessionStats" style="display: none;">
                 <div>
+                    <span class="stat-label">Total Sessions</span>
+                    <span id="totalSessionsDisplay" class="stat-value">0</span>
+                </div>
+                <div>
                     <span class="stat-label">Total Trades</span>
                     <span id="totalTradesDisplay" class="stat-value">0</span>
                 </div>
@@ -442,6 +446,7 @@
         function updateSessionTable(data, container) {
             if (!data || data.length === 0) {
                 container.innerHTML = '<div class="no-data">📈 No sessions found</div>';
+                document.getElementById('totalSessionsDisplay').innerText = '0';
                 document.getElementById('totalTradesDisplay').innerText = '0';
                 document.getElementById('totalPnlDisplay').innerText = '₹0.00';
                 return;
@@ -452,19 +457,23 @@
                 .then(r => r.json())
                 .catch(() => ({ trades_today: 0, net_pnl: 0 }))
                 .then(perf => {
-                    let grandTotalTrades = 0;
                     let grandTotalPnl = 0;
+                    let grandTotalTrades = 0;
 
                     data.forEach(s => {
-                        if (!s.logout_time) return; // skip active row — use live perf instead
-                        grandTotalTrades += parseInt(s.total_trades) || 0;
-                        grandTotalPnl += parseFloat(s.pnl) || 0;
+                        if (!s.logout_time) {
+                            // active session: use live perf
+                            grandTotalTrades += parseInt(perf.trades_today) || 0;
+                            grandTotalPnl += parseFloat(perf.net_pnl) || 0;
+                        } else {
+                            grandTotalTrades += parseInt(s.total_trades) || 0;
+                            grandTotalPnl += parseFloat(s.pnl) || 0;
+                        }
                     });
 
-                    // Add live stats from running bot
-                    grandTotalTrades += parseInt(perf.trades_today) || 0;
-                    grandTotalPnl += parseFloat(perf.net_pnl) || 0;
+                    const grandTotalSessions = data.length;
 
+                    document.getElementById('totalSessionsDisplay').innerText = grandTotalSessions;
                     document.getElementById('totalTradesDisplay').innerText = grandTotalTrades;
                     const pnlDisplay = document.getElementById('totalPnlDisplay');
                     pnlDisplay.innerText = `₹${grandTotalPnl.toFixed(2)}`;
